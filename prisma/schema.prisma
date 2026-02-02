@@ -1,0 +1,72 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum MetricKey {
+  return_rate
+  repeat_visit_rate
+  churn_rate
+}
+
+enum ScopeType {
+  overall
+  category
+}
+
+model Report {
+  id         String   @id @default(cuid())
+  uploadedAt DateTime @default(now())
+  filename   String
+  fileHash   String   @unique
+
+  periods    Period[]
+}
+
+model Period {
+  id        String @id @default(cuid())
+  reportId  String
+  report    Report @relation(fields: [reportId], references: [id], onDelete: Cascade)
+
+  year      Int
+  month     Int
+  periodKey String
+
+  metricValues MetricValue[]
+
+  @@unique([reportId, year, month])
+  @@index([year, month])
+}
+
+model Category {
+  id    String @id @default(cuid())
+  code  Int
+  name  String
+
+  metricValues MetricValue[]
+
+  @@unique([code, name])
+}
+
+model MetricValue {
+  id         String   @id @default(cuid())
+  periodId   String
+  period     Period   @relation(fields: [periodId], references: [id], onDelete: Cascade)
+
+  scopeType  ScopeType
+  categoryId String?
+  category   Category? @relation(fields: [categoryId], references: [id])
+
+  metricKey  MetricKey
+
+  numerator   Float
+  denominator Float
+  value       Float
+
+  @@unique([periodId, scopeType, categoryId, metricKey])
+  @@index([metricKey, periodId])
+}
