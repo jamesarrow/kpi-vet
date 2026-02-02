@@ -11,12 +11,16 @@ export async function POST(req: Request) {
     const file = form.get("file");
 
     if (!(file instanceof File)) {
-      return NextResponse.json({ error: "Файл не получен (ожидается поле file)." }, { status: 400 });
+      return NextResponse.json(
+        { error: "Файл не получен (ожидается поле file)." },
+        { status: 400 }
+      );
     }
 
     const buffer = Buffer.from(await file.arrayBuffer());
     const fileHash = sha256(buffer);
 
+    // дедуп: если уже загружали этот же файл — вернём существующий снимок
     const existing = await prisma.report.findUnique({ where: { fileHash } });
     if (existing) {
       return NextResponse.json({ reportId: existing.id, deduped: true });
@@ -24,75 +28,109 @@ export async function POST(req: Request) {
 
     const parsed = parseWorkbook(buffer);
     if (!parsed.length) {
-      return NextResponse.json({ error: "Не удалось найти месяцы/данные в файле." }, { status: 400 });
+      return NextResponse.json(
+        { error: "Не удалось найти месяцы/данные в файле." },
+        { status: 400 }
+      );
     }
 
+    // 1) создаём снимок
     const report = await prisma.report.create({
       data: { filename: file.name, fileHash },
       select: { id: true },
     });
 
-    await prisma.$transaction(async (tx) => {
-      const periodMap = new Map<string, { id: string }>();
+    // 2) собираем уникальные периоды и категории
+    const periodsMap = new Map<string, { year: number; month: number; periodKey: string }>();
+    const categoriesMap = new Map<string, { code: number; name: string }>();
 
-      const uniquePeriods = new Map<string, { year: number; month: number; periodKey: string }>();
-      for (const row of parsed) {
-        const key = `${row.year}-${row.month}`;
-        if (!uniquePeriods.has(key)) {
-          uniquePeriods.set(key, { year: row.year, month: row.month, periodKey: row.periodKey });
-        }
-      }
+    for (const row of parsed) {
+      periodsMap.set(`${row.year}-${row.month}`, {
+        year: row.year,
+        month: row.month,
+        periodKey: row.periodKey,
+      });
 
-      for (const p of uniquePeriods.values()) {
-        const created = await tx.period.create({
-          data: {
-            reportId: report.id,
-            year: p.year,
-            month: p.month,
-            periodKey: p.periodKey,
-          },
-          select: { id: true },
+      if (row.scopeType === "category" && row.category) {
+        categoriesMap.set(`${row.category.code}|${row.category.name}`, {
+          code: row.category.code,
+          name: row.category.name,
         });
-        periodMap.set(`${p.year}-${p.month}`, created);
       }
+    }
 
-      const categoryIdByKey = new Map<string, string>();
+    const periods = Array.from(periodsMap.values());
+    const categories = Array.from(categoriesMap.values());
 
-      for (const row of parsed) {
-        if (row.scopeType !== "category" || !row.category) continue;
-        const key = `${row.category.code}|${row.category.name}`;
-        if (categoryIdByKey.has(key)) continue;
+    // 3) вставляем периоды пачкой
+    await prisma.period.createMany({
+      data: periods.map((p) => ({
+        reportId: report.id,
+        year: p.year,
+        month: p.month,
+        periodKey: p.periodKey,
+      })),
+    });
 
-        const cat = await tx.category.upsert({
-          where: { code_name: { code: row.category.code, name: row.category.name } },
-          update: {},
-          create: { code: row.category.code, name: row.category.name },
-          select: { id: true },
-        });
-        categoryIdByKey.set(key, cat.id);
-      }
+    // 4) вставляем категории пачкой (если есть)
+    if (categories.length) {
+      await prisma.category.createMany({
+        data: categories.map((c) => ({ code: c.code, name: c.name })),
+        skipDuplicates: true,
+      });
+    }
 
-      for (const row of parsed) {
-        const period = periodMap.get(`${row.year}-${row.month}`);
-        if (!period) continue;
+    // 5) получаем id периодов и категорий (для связей)
+    const dbPeriods = await prisma.period.findMany({
+      where: { reportId: report.id },
+      select: { id: true, year: true, month: true },
+    });
+
+    const periodIdByKey = new Map<string, string>();
+    for (const p of dbPeriods) periodIdByKey.set(`${p.year}-${p.month}`, p.id);
+
+    let categoryIdByKey = new Map<string, string>();
+    if (categories.length) {
+      const codes = Array.from(new Set(categories.map((c) => c.code)));
+      const dbCategories = await prisma.category.findMany({
+        where: { code: { in: codes } },
+        select: { id: true, code: true, name: true },
+      });
+      categoryIdByKey = new Map(dbCategories.map((c) => [`${c.code}|${c.name}`, c.id]));
+    }
+
+    // 6) вставляем метрики пачкой
+    const metricValues = parsed
+      .map((row) => {
+        const periodId = periodIdByKey.get(`${row.year}-${row.month}`);
+        if (!periodId) return null;
 
         const categoryId =
           row.scopeType === "category" && row.category
             ? categoryIdByKey.get(`${row.category.code}|${row.category.name}`) ?? null
             : null;
 
-        await tx.metricValue.create({
-          data: {
-            periodId: period.id,
-            scopeType: row.scopeType,
-            categoryId,
-            metricKey: "return_rate",
-            numerator: row.repeatClients,
-            denominator: row.allClients,
-            value: row.value,
-          },
-        });
-      }
+        return {
+          periodId,
+          scopeType: row.scopeType,
+          categoryId,
+          metricKey: "return_rate" as const,
+          numerator: row.repeatClients,
+          denominator: row.allClients,
+          value: row.value,
+        };
+      })
+      .filter(Boolean) as any[];
+
+    if (!metricValues.length) {
+      return NextResponse.json(
+        { error: "Данные распарсились, но не удалось сформировать метрики." },
+        { status: 400 }
+      );
+    }
+
+    await prisma.metricValue.createMany({
+      data: metricValues,
     });
 
     return NextResponse.json({ reportId: report.id, deduped: false });
