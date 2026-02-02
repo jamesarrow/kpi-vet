@@ -22,9 +22,27 @@ export async function POST(req: Request) {
 
     // дедуп: если уже загружали этот же файл — вернём существующий снимок
     const existing = await prisma.report.findUnique({ where: { fileHash } });
-    if (existing) {
-      return NextResponse.json({ reportId: existing.id, deduped: true });
-    }
+
+if (existing) {
+  // проверяем: этот "снимок" реально содержит данные, или он пустой/битый
+  const hasPeriod = await prisma.period.findFirst({
+    where: { reportId: existing.id },
+    select: { id: true },
+  });
+
+  const hasMetric = await prisma.metricValue.findFirst({
+    where: { period: { reportId: existing.id } },
+    select: { id: true },
+  });
+
+  // если есть периоды и метрики — файл реально уже загружен
+  if (hasPeriod && hasMetric) {
+    return NextResponse.json({ reportId: existing.id, deduped: true });
+  }
+
+  // иначе это битый снимок от прошлой ошибки — удаляем и импортируем заново
+  await prisma.report.delete({ where: { id: existing.id } });
+}
 
     const parsed = parseWorkbook(buffer);
     if (!parsed.length) {
