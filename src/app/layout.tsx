@@ -1,6 +1,7 @@
 import "./globals.css";
 import type { Metadata } from "next";
 import { Sidebar } from "@/components/Sidebar";
+export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
   title: "Метрики ветклиники",
